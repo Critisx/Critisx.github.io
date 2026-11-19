@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="PDF Filler">
+<link rel="manifest" href="manifest.json">
+<title>PDF Filler</title>
+<style>
+:root{--ink:#14213d;--bg:#eef1f5;--card:#fff;--line:#c9d1dc;--acc:#2563eb;--fld:rgba(37,99,235,.12)}
+@media(prefers-color-scheme:dark){:root{--ink:#e8edf5;--bg:#0f1520;--card:#1a2331;--line:#34425a;--acc:#6ea0ff;--fld:rgba(110,160,255,.18)}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.4 -apple-system,system-ui,"Segoe UI",sans-serif}
+body{padding:env(safe-area-inset-top) 0 calc(env(safe-area-inset-bottom) + 76px)}
+header{padding:16px 16px 8px}
+h1{font-size:22px;margin:0 0 4px;letter-spacing:-.01em}
+#status{font-size:14px;opacity:.8;min-height:20px}
+#bar{height:4px;background:var(--line);border-radius:2px;margin-top:8px;overflow:hidden;display:none}
+#bar i{display:block;height:100%;width:0;background:var(--acc)}
+#pick{margin:12px 16px;padding:28px 16px;border:2px dashed var(--line);border-radius:12px;text-align:center;display:block;cursor:pointer}
+#pick b{display:block;font-size:18px}
+input[type=file]{display:none}
+#pages{display:flex;flex-direction:column;gap:12px;align-items:center;padding:0 8px}
+.pg{position:relative;width:100%;max-width:820px;background:#fff;box-shadow:0 1px 6px rgba(0,0,0,.25)}
+.pg canvas{display:block;width:100%;height:auto}
+.fb{position:absolute;margin:0;font:16px system-ui,sans-serif;color:#0b1b4d;background:var(--fld);border:1.5px solid var(--acc);border-radius:3px;padding:0 4px;min-height:28px;transform:translateY(-50%)}
+.fb[type=checkbox]{appearance:auto;accent-color:var(--acc);min-height:0;padding:0;transform:translate(0,-50%)}
+.editing .fb{outline:2px dashed #e11d48;pointer-events:none}
+.editing .fbx{position:absolute;z-index:3;background:rgba(225,29,72,.001);transform:translateY(-50%)}
+nav{position:fixed;left:0;right:0;bottom:0;display:flex;gap:8px;padding:10px 12px calc(10px + env(safe-area-inset-bottom));background:var(--card);border-top:1px solid var(--line)}
+button,.btn{flex:1;font:600 16px system-ui;padding:12px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
+button.p{background:var(--acc);border-color:var(--acc);color:#fff}
+button.on{background:#e11d48;border-color:#e11d48;color:#fff}
+button:disabled{opacity:.4}
+#hint{display:none;margin:0 16px 8px;font-size:14px;color:#e11d48}
+</style></head>
+<body>
+<header><h1>PDF Filler</h1><div id="status">Choose a PDF to start.</div><div id="bar"><i></i></div></header>
+<label id="pick"><b>Choose a PDF</b>Blanks become tap-to-type boxes<input id="file" type="file" accept="application/pdf"></label>
+<div id="hint">Edit mode: tap a box to delete it, tap empty space to add one.</div>
+<div id="pages"></div>
+<nav><button id="edit" disabled>Edit boxes</button><button id="save" class="p" disabled>Save / Share</button></nav>
+
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.wasm.min.js" crossorigin="anonymous"></script>
+<script>
+const MODEL_URL='https://huggingface.co/jbarrow/FFDNet-S-cpu/resolve/main/FFDNet-S.onnx'; // or use a local './FFDNet-S.onnx'
+const MODEL_KEY='ffdnet-s-model-v1', ORT='https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+const PDFJS='https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+const CONF=0.3, CLASSES=['text','check','text']; // class order is an assumption: verify on a test form
+const $=id=>document.getElementById(id);
+let session=null, S=1216, pdfBytes=null, pages=[], fields=[], editing=false;
+
+const say=(t,p)=>{$('status').textContent=t;const b=$('bar');if(p==null){b.style.display='none'}else{b.style.display='block';b.firstChild.style.width=(p*100)+'%'}};
+
+// Make the app work offline: let the service worker cache every script and the PDF worker.
+(async()=>{
+  if(!('serviceWorker' in navigator))return;
+  try{await navigator.serviceWorker.register('sw.js');await navigator.serviceWorker.ready;
+    document.querySelectorAll('script[src]').forEach(s=>fetch(s.src).catch(()=>{}));
+  }catch(e){console.warn('sw',e)}
+})();
+
+async function getModelBytes(){
+  const cache=await caches.open('pdf-filler-model-s');caches.delete('pdf-filler-model');
+  let r=await cache.match(MODEL_KEY);
+  if(!r){
+    say('Downloading detection model (one time, ~40 MB)…',0);
+    let res;
+    try{res=await fetch(MODEL_URL);if(!res.ok)throw 0}catch(e){
+      say('Download failed. Choose a downloaded FFDNet .onnx file to continue.');
+      const f=await new Promise(ok=>{const i=document.createElement('input');i.type='file';i.onchange=()=>ok(i.files[0]);
+        const b=document.createElement('button');b.textContent='Choose model file';b.className='p';b.style.margin='0 16px';
+        b.onclick=()=>i.click();$('hint').after(b);window._mb=b});
+      window._mb.remove();
+      const buf=await f.arrayBuffer();await cache.put(MODEL_KEY,new Response(buf));return buf;
+    }
+    const total=+res.headers.get('content-length')||1e8, rd=res.body.getReader(), parts=[];let got=0;
+    for(;;){const{done,value}=await rd.read();if(done)break;parts.push(value);got+=value.length;say('Downloading detection model… '+Math.round(got/1e6)+' MB',Math.min(got/total,1))}
+    const blob=new Blob(parts);await cache.put(MODEL_KEY,new Response(blob));r=await cache.match(MODEL_KEY);
+  }
+  return r.arrayBuffer();
+}
+async function loadModel(){
+  if(session)return;
+  ort.env.wasm.wasmPaths=ORT;ort.env.wasm.numThreads=1;
+  const buf=await getModelBytes();
+  say('Starting detector…');
+  session=await ort.InferenceSession.create(buf,{executionProviders:['wasm'],graphOptimizationLevel:'basic',enableCpuMemArena:false,enableMemPattern:false});
+}
+async function run(canvasData){
+  const n=S*S,f=new Float32Array(3*n);
+  for(let i=0;i<n;i++){f[i]=canvasData[i*4]/255;f[n+i]=canvasData[i*4+1]/255;f[2*n+i]=canvasData[i*4+2]/255}
+  for(let tries=0;tries<2;tries++){
+    try{return await session.run({[session.inputNames[0]]:new ort.Tensor('float32',f,[1,3,S,S])})}
+    catch(e){const m=/Expected:\s*(\d+)/.exec(String(e.message||e));if(m&&+m[1]!==S&&tries===0){S=+m[1];return null}throw e}
+  }
+}
+function iou(a,b){const x1=Math.max(a.x1,b.x1),y1=Math.max(a.y1,b.y1),x2=Math.min(a.x2,b.x2),y2=Math.min(a.y2,b.y2);
+  const i=Math.max(0,x2-x1)*Math.max(0,y2-y1);return i/((a.x2-a.x1)*(a.y2-a.y1)+(b.x2-b.x1)*(b.y2-b.y1)-i+1e-6)}
+function parse(out){
+  const t=out[session.outputNames[0]],d=t.dims,a=t.data,c=[];
+  if(d[2]===6){for(let i=0;i<d[1];i++){const o=i*6;if(a[o+4]>=CONF)c.push({x1:a[o],y1:a[o+1],x2:a[o+2],y2:a[o+3],s:a[o+4],c:a[o+5]})}}
+  else{const N=d[2],nc=d[1]-4;for(let i=0;i<N;i++){let b=0,s=0;for(let k=0;k<nc;k++){const v=a[(4+k)*N+i];if(v>s){s=v;b=k}}
+    if(s<CONF)continue;const cx=a[i],cy=a[N+i],w=a[2*N+i],h=a[3*N+i];c.push({x1:cx-w/2,y1:cy-h/2,x2:cx+w/2,y2:cy+h/2,s,c:b})}}
+  c.sort((p,q)=>q.s-p.s);const keep=[];
+  for(const x of c)if(!keep.some(k=>iou(k,x)>0.5))keep.push(x);
+  return keep;
+}
+async function detect(page){
+  const vp=page.getViewport({scale:1}),sc=S/Math.max(vp.width,vp.height);
+  const w=Math.round(vp.width*sc),h=Math.round(vp.height*sc),px=Math.floor((S-w)/2),py=Math.floor((S-h)/2);
+  const cv=document.createElement('canvas');cv.width=S;cv.height=S;const g=cv.getContext('2d',{willReadFrequently:true});
+  g.fillStyle='rgb(114,114,114)';g.fillRect(0,0,S,S);
+  const pc=document.createElement('canvas');pc.width=w;pc.height=h;
+  await page.render({canvasContext:pc.getContext('2d'),viewport:page.getViewport({scale:sc})}).promise;
+  g.fillStyle='#fff';g.fillRect(px,py,w,h);g.drawImage(pc,px,py);
+  const out=await run(g.getImageData(0,0,S,S).data);
+  if(!out)return detect(page); // model wanted another input size: retry
+  return parse(out).map(b=>({x:(b.x1-px)/sc,y:(b.y1-py)/sc,w:(b.x2-b.x1)/sc,h:(b.y2-b.y1)/sc,type:CLASSES[b.c]||'text'}))
+    .filter(b=>b.w>4&&b.h>4);
+}
+
+function mount(pi,f){ // f in PDF points (top-left origin)
+  const P=pages[pi],el=document.createElement('input');
+  f.page=pi;f.el=el;f.value=f.value||'';
+  if(f.type==='check'){el.type='checkbox';el.className='fb';el.onchange=()=>f.value=el.checked?'1':''}
+  else{el.type='text';el.className='fb';el.autocomplete='off';el.oninput=()=>f.value=el.value}
+  el.onpointerdown=e=>{if(editing){e.preventDefault();remove(f)}};
+  P.box.appendChild(el);place(f);fields.push(f);
+}
+function place(f){const P=pages[f.page],el=f.el;
+  el.style.left=(f.x/P.w*100)+'%';el.style.top=((f.y+f.h/2)/P.h*100)+'%';
+  if(f.type==='check'){const s=Math.max(f.w/P.w*100,3);el.style.width=s+'%';el.style.height='auto';el.style.aspectRatio='1'}
+  else{el.style.width=(f.w/P.w*100)+'%';el.style.height=Math.max(f.h/P.h*100,0)+'%'}}
+function remove(f){f.el.remove();fields=fields.filter(x=>x!==f)}
+
+$('file').onchange=async e=>{
+  const file=e.target.files[0];if(!file)return;
+  try{
+    $('pick').style.display='none';$('pages').innerHTML='';pages=[];fields=[];
+    pdfBytes=new Uint8Array(await file.arrayBuffer());
+    pdfjsLib.GlobalWorkerOptions.workerSrc=URL.createObjectURL(new Blob([await (await fetch(PDFJS)).text()],{type:'text/javascript'}));
+    await loadModel();
+    const doc=await pdfjsLib.getDocument({data:pdfBytes.slice()}).promise;
+    for(let i=1;i<=doc.numPages;i++){
+      say('Reading page '+i+' of '+doc.numPages+'…',(i-1)/doc.numPages);
+      const page=await doc.getPage(i),vp=page.getViewport({scale:1});
+      const box=document.createElement('div');box.className='pg';const cv=document.createElement('canvas');box.appendChild(cv);$('pages').appendChild(box);
+      const dpr=Math.min(window.devicePixelRatio||1,2),sc=Math.min(2*dpr,(Math.min(innerWidth,820)*dpr*1.5)/vp.width);
+      const v2=page.getViewport({scale:sc});cv.width=v2.width;cv.height=v2.height;
+      await page.render({canvasContext:cv.getContext('2d'),viewport:v2}).promise;
+      const P={box,w:vp.width,h:vp.height};pages.push(P);
+      box.onclick=ev=>{if(!editing||ev.target!==cv)return;const r=cv.getBoundingClientRect(),k=P.w/r.width;
+        mount(pages.indexOf(P),{x:(ev.clientX-r.left)*k-60,y:(ev.clientY-r.top)*k-8,w:120,h:16,type:'text'})};
+      say('Finding blanks on page '+i+'…',(i-.5)/doc.numPages);
+      (await detect(page)).forEach(f=>mount(i-1,f));
+    }
+    say(fields.length+' boxes found. Tap one to type. Use Edit boxes to fix any misses.');
+    $('edit').disabled=$('save').disabled=false;
+  }catch(err){console.error(err);say(typeof err==='number'||!(err&&err.message)?'The detector ran out of memory (code '+err+'). Close other tabs and try again.':'Something failed: '+err.message+' Reload and try again.');$('pick').style.display='block'}
+};
+$('edit').onclick=()=>{editing=!editing;$('edit').classList.toggle('on',editing);$('edit').textContent=editing?'Done editing':'Edit boxes';
+  $('pages').classList.toggle('editing',editing);$('hint').style.display=editing?'block':'none'};
+
+$('save').onclick=async()=>{
+  try{
+    say('Building your PDF…');
+    const {PDFDocument}=PDFLib,pdf=await PDFDocument.load(pdfBytes,{ignoreEncryption:true}),form=pdf.getForm(),pp=pdf.getPages();
+    fields.forEach((f,i)=>{
+      const pg=pp[f.page],cb=pg.getCropBox(),o={x:cb.x+f.x,y:cb.y+cb.height-f.y-f.h,width:f.w,height:f.h,borderWidth:0};
+      if(f.type==='check'){const c=form.createCheckBox('f'+i);c.addToPage(pg,o);if(f.value)c.check()}
+      else{const t=form.createTextField('f'+i);t.addToPage(pg,o);if(f.value)t.setText(f.value)}
+    });
+    const out=await pdf.save(),file=new File([out],'filled.pdf',{type:'application/pdf'});
+    if(navigator.canShare&&navigator.canShare({files:[file]}))await navigator.share({files:[file],title:'filled.pdf'}).catch(()=>{});
+    else{const a=document.createElement('a');a.href=URL.createObjectURL(file);a.download='filled.pdf';a.click()}
+    say('Saved. Your boxes are still editable.');
+  }catch(e){say('Could not save: '+e.message)}
+};
+</script></body></html>
